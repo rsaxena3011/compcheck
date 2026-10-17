@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CompCheck - Validate your pitch comps against real audience data</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="wrap">
+    <div class="brand"><span class="logo">CC</span> CompCheck</div>
+    <div class="tagline">Do your comps share an audience, or just a genre tag?</div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="card" id="pitch-card">
+    <h2>Your pitch</h2>
+    <div class="grid2">
+      <label>Working title
+        <input id="in-title" type="text" value="Kali's Harvest">
+      </label>
+      <label>Genre
+        <input id="in-genre" type="text" value="Folk Horror">
+      </label>
+    </div>
+    <label>Logline
+      <textarea id="in-logline" rows="3">A cursed harvest festival in rural Maharashtra forces a young widow to confront the folk goddess her village has fed for generations.</textarea>
+    </label>
+    <label>Comp titles (the ones in your deck)
+      <div class="comps">
+        <input id="in-comp1" type="text" value="Tumbbad">
+        <input id="in-comp2" type="text" value="The Witch">
+        <input id="in-comp3" type="text" value="RRR">
+      </div>
+    </label>
+
+    <div class="mode-row">
+      <span class="mode-label">Validation mode</span>
+      <div class="toggle" id="mode-toggle" role="switch" aria-checked="false" tabindex="0">
+        <div class="toggle-opt active" data-mode="llm">LLM Only</div>
+        <div class="toggle-opt" data-mode="qloo">Qloo Grounded</div>
+        <div class="toggle-thumb"></div>
+      </div>
+      <span class="mode-hint" id="mode-hint">Language model reasoning. Plausible, unverified.</span>
+    </div>
+
+    <button id="run-btn" class="primary">Run CompCheck</button>
+    <p class="fineprint">Demo build. Audience data is <strong>simulated with mock fixtures</strong> until the Qloo hackathon API key arrives. No real Qloo responses are used or stored.</p>
+  </section>
+
+  <section class="card hidden" id="trace-card">
+    <h2>Agent trace</h2>
+    <ol id="trace" class="trace"></ol>
+  </section>
+
+  <section class="card hidden" id="results-card">
+    <h2>Verdict <span id="verdict-badge" class="badge"></span></h2>
+    <p id="verdict-summary" class="verdict-summary"></p>
+    <h3>Comp validation</h3>
+    <div id="comp-cards" class="comp-cards"></div>
+    <h3>Audience overlap</h3>
+    <div id="overlap" class="overlap"></div>
+    <div id="insights-block">
+      <h3>What this audience actually loves <span class="qloo-only">(Qloo mode)</span></h3>
+      <div id="insights" class="insights"></div>
+    </div>
+    <div id="suggest-block">
+      <h3>Pitch these instead <span class="qloo-only">(Qloo mode)</span></h3>
+      <div id="suggest" class="suggest"></div>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap fineprint">
+  CompCheck - Qloo Agentic Hackathon entry. Built against mock Qloo fixtures; swap in <code>hackathon.api.qloo.com</code> when the key lands.
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
