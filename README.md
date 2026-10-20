@@ -37,17 +37,20 @@ The full reasoning trace is visible in the UI, step by step.
 
 Delete the Qloo calls and the product collapses to "an LLM guessing comps" - which is exactly what the LLM Only toggle demonstrates.
 
-## Current status: mock fixtures
+## Current status: LIVE on the Qloo API (2026-10-20)
 
-The Qloo hackathon API key is pending (requested 2026-10-17, issued manually). Until it arrives, the app runs against **8 mock fixtures** in `fixtures/` that simulate Qloo API shapes:
+The Qloo hackathon API key landed 2026-10-20 00:59 IST. Kill tests passed: 20/20 demo
+titles (incl. Tumbbad, the anchor) resolve via `GET /search`, and the demo beat
+reproduces on live data: Tumbbad x The Witch = TRUE COMP (27% taste overlap, shared
+Folk horror / Slow burn), Tumbbad x RRR = FALSE COMP (7%, generic tags only).
+The app now calls `https://hackathon.api.qloo.com` directly from the page with
+the `X-Api-Key` header (hackathon-scoped demo key). Responses are used in-memory
+only; **never commit real Qloo responses to this repo**.
 
-- `search.json` - entity resolution (8 titles)
-- `audience-tumbbad.json`, `audience-the-witch.json`, `audience-rrr.json` - demographics
-- `compare.json` - pairwise audience overlap (the TRUE/FALSE comp verdicts)
-- `cross-domain.json` - artists, brands, podcasts affinities
-- `suggest.json` - validated alternative comps
-
-Every fixture is labeled `_mock`. When the key lands: run the kill tests (resolve 20 titles; check cross-domain non-obviousness; check compare signal), then swap `fetch("fixtures/...")` for live `hackathon.api.qloo.com` calls with the `X-Api-Key` header. **Never commit real Qloo responses to this repo** - server-side cache only.
+Verdict math: pairwise "taste overlap" = Jaccard similarity of the two films'
+curated taste-tag profiles (Qloo's genre / subgenre / theme / plot / style
+tags). TRUE COMP at >= 20% overlap. Audience profiles, cross-domain
+affinities and suggestions come from live `GET /v2/insights` calls.
 
 ## Run locally
 
@@ -59,7 +62,7 @@ npx serve .
 python3 -m http.server 8080
 ```
 
-Then open http://localhost:8080. (Note: `file://` won't load fixtures; use a server.)
+Then open http://localhost:8080. (All data is live from the Qloo API, so any static server works.)
 
 ## Deploy
 
