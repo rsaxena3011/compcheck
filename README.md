@@ -10,7 +10,7 @@ Built for the [Qloo Agentic Hackathon](https://qloo.devpost.com/).
 
 ## Live demo
 
-Hosted demo: _(deploy URL goes here once published)_
+Hosted demo: https://rsaxena3011.github.io/compcheck/
 
 No login. Judges can run the prefilled demo pitch or enter their own.
 
