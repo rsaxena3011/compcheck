@@ -27,3 +27,7 @@ npx wrangler deploy
 ```
 
 Then set `QLOO_PROXY` in `app.js` to the deployed URL, commit, and let GitHub Pages redeploy. Rotating the key afterwards is a one-command secret update; no client change is needed.
+
+## Note (2026-10-21): Cloudflare blocked, ported to Vercel
+
+The Cloudflare deploy above never happened: it was blocked at Cloudflare's sign-in on 2026-10-21. The same proxy has been ported to a Vercel serverless function instead, in its own repo: [rsaxena3011/compcheck-proxy](https://github.com/rsaxena3011/compcheck-proxy) (same allowlist, same `QLOO_API_KEY` variable, same upstream and caching; the key there is set as a Vercel environment variable in the dashboard). `worker.js` in this folder remains the Cloudflare reference implementation if that route ever unblocks.
