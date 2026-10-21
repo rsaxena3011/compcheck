@@ -1,192 +1,264 @@
-/* CompCheck - agent loop over the LIVE Qloo Taste AI API.
-   All Qloo calls go to https://hackathon.api.qloo.com with the X-Api-Key
-   header (hackathon-scoped demo key, client-side for the public demo build).
-   Responses are used in-memory only; no Qloo response data is stored or
-   committed anywhere (per Qloo hackathon terms).
+/* CompCheck - a verification agent over the LIVE Qloo Taste AI API.
+   Two-axis verdict engine:
+   - TONE axis: Jaccard similarity of two films' Qloo taste-tag profiles
+     (subgenre / theme / plot / style tags from GET /search). Duplicate tag
+     names are merged across urn types and broad genre labels (genre:media,
+     genre:qloo) are excluded from the score: they measure filing, not tone.
+   - AUDIENCE axis: affinity from GET /v2/insights
+     (signal.interests.entities = the reference comp,
+      filter.results.entities = the comp + three unrelated control films,
+      scored in one batch). A comp passes only if its affinity beats the
+     strongest control: popularity alone is not evidence.
+   Four verdicts: TRUE (both axes), TONE (tone only), MARKET (audience
+   only), FALSE (neither). Plus honest non-verdicts: UNRESOLVED (title not
+   in the catalog) and ERROR (the API failed; an error is never evidence).
+   Responses are used in-memory only; no Qloo response data is stored.
 
-   Verdict logic (Qloo mode): pairwise "taste overlap" = Jaccard similarity
-   of the two films' curated taste-tag profiles (genre / subgenre / theme /
-   plot / style tags from Qloo's own graph, via GET /search), backed by
-   live audience affinity lists and demographics from GET /v2/insights.
-   Kill tests 2026-10-20: 20/20 demo titles resolve via /search, and the
-   demo beat reproduces live: Tumbbad x The Witch = TRUE (0.27 taste
-   overlap, shared: Folk horror, Slow burn), Tumbbad x RRR = FALSE (0.07,
-   generic tags only). */
+   Proxy readiness: set QLOO_PROXY to the deployed proxy/worker.js URL and
+   every call routes through it (the worker injects the key server-side).
+   While QLOO_PROXY is empty the client calls the API directly, as the
+   live demo does today. */
 
-const QLOO_BASE = "https://hackathon.api.qloo.com";
+const QLOO_PROXY = ""; // e.g. "https://compcheck-proxy.example.workers.dev"
+const QLOO_DIRECT = "https://hackathon.api.qloo.com";
 const QLOO_KEY = "***REMOVED***";
-const TRUE_THRESHOLD = 0.20;
+const TONE_THRESHOLD = 0.10; // calibrated: see README "Calibration"
+const CONTROL_TITLES = ["Dangal", "Paddington 2", "Top Gun: Maverick"];
 const TASTE_TAG_TYPES = new Set([
   "urn:tag:genre:media", "urn:tag:genre:qloo", "urn:tag:subgenre:qloo",
   "urn:tag:theme:qloo", "urn:tag:plot:qloo", "urn:tag:style:qloo"
 ]);
+const GENRE_TAG_TYPES = new Set(["urn:tag:genre:media", "urn:tag:genre:qloo"]);
 const TAG_TYPE_RANK = {
   "urn:tag:subgenre:qloo": 0, "urn:tag:theme:qloo": 1, "urn:tag:genre:qloo": 2,
   "urn:tag:genre:media": 3, "urn:tag:plot:qloo": 4, "urn:tag:style:qloo": 5
 };
+/* Logline/genre keyword -> Qloo tag-name expansions. Used ONLY to
+   auto-select the reference comp; every match is shown in the trace. */
+const KEYWORD_EXPANSIONS = {
+  folk: ["folk horror", "folklore"], horror: ["horror", "folk horror"],
+  curse: ["curse", "cursed", "supernatural"], cursed: ["curse", "supernatural"],
+  goddess: ["goddess", "deity", "mythology", "folklore"],
+  god: ["deity", "mythology"], mythology: ["mythology", "mythological", "folklore"],
+  mythological: ["mythology", "folklore"], village: ["village", "rural"],
+  rural: ["rural", "village"], harvest: ["harvest", "farming", "agriculture"],
+  festival: ["festival", "celebration"], widow: ["widow", "grief"],
+  witch: ["witch", "witchcraft", "occult"], demon: ["demon", "occult", "supernatural"],
+  ghost: ["ghost", "haunted", "supernatural"], haunted: ["haunted", "ghost"],
+  forest: ["forest", "woods"], wedding: ["wedding", "marriage"],
+  heist: ["heist", "robbery"], space: ["space", "sci-fi", "outer space"],
+  war: ["war", "battle"], love: ["romance", "love"], revenge: ["revenge", "vengeance"]
+};
 
-let mode = "llm"; // 'llm' | 'qloo'
+let mode = "baseline"; // 'baseline' | 'qloo'
 let lastPitch = null;
-let runData = { pairs: {}, cross: [], suggest: [] };
 
+/* ---------- small utils ---------- */
 const $ = id => document.getElementById(id);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const norm = s => s.toLowerCase().trim();
+const norm = s => (s || "").toLowerCase().trim();
+const normKey = s => norm(s).replace(/^the\s+/, "").replace(/[^a-z0-9]/g, "");
+const pct1 = x => (x * 100).toFixed(1) + "%";
+const aff1 = x => (x * 100).toFixed(1);
 
-/* ---------- live Qloo client (in-memory cache only) ---------- */
-const cache = { search: {}, audience: {}, cross: {}, suggest: {} };
+/* ---------- Qloo client (in-memory cache; errors are never cached) ---------- */
+const cache = { resolve: {}, cross: {}, demo: {} };
 
 async function qlooGet(path) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 25000);
-  try {
-    const res = await fetch(QLOO_BASE + path, {
-      headers: { "X-Api-Key": QLOO_KEY }, signal: ctrl.signal
-    });
-    if (!res.ok) throw new Error("Qloo HTTP " + res.status);
-    return await res.json();
-  } finally { clearTimeout(timer); }
-}
-
-function tasteTags(entity) {
-  const seen = new Map();
-  (entity.tags || []).forEach(t => {
-    if (TASTE_TAG_TYPES.has(t.type) && !seen.has(t.tag_id))
-      seen.set(t.tag_id, { id: t.tag_id, name: t.name, type: t.type });
-  });
-  return [...seen.values()].sort((a, b) =>
-    (TAG_TYPE_RANK[a.type] - TAG_TYPE_RANK[b.type]) || a.name.localeCompare(b.name));
-}
-
-async function resolveEntity(title) {
-  const key = norm(title);
-  if (cache.search[key]) return cache.search[key];
-  let entity = null;
-  try {
-    const q = encodeURIComponent(title);
-    const data = await qlooGet("/search?query=" + q + "&types=urn:entity:movie,urn:entity:tv_show");
-    const results = (data.results || []).filter(r =>
-      (r.types || []).some(t => t === "urn:entity:movie" || t === "urn:entity:tv_show"));
-    const hit = results.find(r => norm(r.name) === key) || results[0];
-    if (hit) {
-      entity = {
-        entity_id: hit.entity_id,
-        name: hit.name,
-        year: hit.properties && hit.properties.release_year || null,
-        popularity: hit.popularity || 0,
-        properties: {
-          genre: (hit.properties && hit.properties.genres) || [],
-          description: (hit.properties && hit.properties.description) || ""
-        },
-        tags: tasteTags(hit),
-        simulated: false
-      };
-    }
-  } catch (err) { /* fall through to simulated */ }
-  if (!entity) {
-    // Unresolved title: clearly-labeled simulated entity so any pitch still runs.
-    entity = {
-      entity_id: "sim-ent-" + key.replace(/[^a-z0-9]+/g, "-"),
-      name: title.trim(),
-      year: null,
-      popularity: 0.5,
-      properties: { genre: ["Unknown"], description: "Not resolved in the live Qloo catalog." },
-      tags: [],
-      simulated: true
-    };
+  const url = (QLOO_PROXY || QLOO_DIRECT) + path;
+  const headers = QLOO_PROXY ? {} : { "X-Api-Key": QLOO_KEY };
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25000);
+    try {
+      const res = await fetch(url, { headers, signal: ctrl.signal });
+      if (!res.ok) throw new Error("Qloo HTTP " + res.status);
+      return await res.json();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 0) await sleep(1000);
+    } finally { clearTimeout(timer); }
   }
-  cache.search[key] = entity;
-  return entity;
+  throw new Error("Qloo API request failed (" + (lastErr && lastErr.message || "network") + ")");
 }
 
-function sharedTags(a, b) {
-  const bIds = new Set(b.tags.map(t => t.id));
-  const seenNames = new Set(), out = [];
-  for (const t of a.tags) {
-    if (bIds.has(t.id) && !seenNames.has(t.name)) { seenNames.add(t.name); out.push(t); }
+async function searchMovies(title) {
+  const q = encodeURIComponent(title);
+  const data = await qlooGet("/search?query=" + q + "&types=urn:entity:movie,urn:entity:tv_show");
+  return (data.results || []).filter(r =>
+    (r.types || []).some(t => t === "urn:entity:movie" || t === "urn:entity:tv_show"));
+}
+
+function toEntity(hit) {
+  const allNames = new Map(); // normKey(name) -> {name, type}
+  const toneNames = new Map(); // taste tags minus broad genre labels
+  for (const t of hit.tags || []) {
+    if (!TASTE_TAG_TYPES.has(t.type)) continue;
+    const k = normKey(t.name);
+    if (!allNames.has(k)) allNames.set(k, { name: t.name, type: t.type });
+    if (!GENRE_TAG_TYPES.has(t.type) && !toneNames.has(k))
+      toneNames.set(k, { name: t.name, type: t.type });
   }
-  return out;
-}
-function tasteOverlap(a, b) {
-  const aIds = new Set(a.tags.map(t => t.id)), bIds = new Set(b.tags.map(t => t.id));
-  const inter = [...aIds].filter(id => bIds.has(id)).length;
-  const union = new Set([...aIds, ...bIds]).size;
-  return union ? inter / union : 0;
-}
-function pairKey(a, b) { return [a.entity_id, b.entity_id].sort().join("|"); }
-
-function computePair(a, b) {
-  const shared = sharedTags(a, b);
-  const ov = tasteOverlap(a, b);
-  const isTrue = ov >= TRUE_THRESHOLD;
-  const topA = a.tags.slice(0, 3).map(t => t.name).join(", ");
-  const topB = b.tags.slice(0, 3).map(t => t.name).join(", ");
+  const byRank = (a, b) => (TAG_TYPE_RANK[a.type] - TAG_TYPE_RANK[b.type]) || a.name.localeCompare(b.name);
   return {
-    a: a.name, b: b.name,
-    audience_overlap: ov,
-    shared_affinities: shared.slice(0, 4).map(t => t.name),
-    verdict: isTrue ? "TRUE_COMP" : "FALSE_COMP",
-    divergence: isTrue ? "" :
-      "Shared taste is generic only (" + (shared.map(t => t.name).join(", ") || "none") +
-      "). " + b.name + " profiles as " + topB + "; " + a.name + " profiles as " + topA + "."
+    entity_id: hit.entity_id,
+    name: hit.name,
+    year: (hit.properties && hit.properties.release_year) || null,
+    popularity: hit.popularity || 0,
+    description: (hit.properties && hit.properties.description) || "",
+    genreNames: [...allNames.values()].filter(t => GENRE_TAG_TYPES.has(t.type)).map(t => t.name),
+    allTagNames: [...allNames.values()].sort(byRank),
+    toneTags: toneNames // Map normKey -> {name, type}
   };
 }
 
-async function audienceProfile(entity) {
-  if (cache.audience[entity.entity_id]) return cache.audience[entity.entity_id];
-  const out = { topTitles: [], skew: "" };
-  try {
-    const [movies, demo] = await Promise.all([
-      qlooGet("/v2/insights?filter.type=urn:entity:movie&signal.interests.entities=" +
-        entity.entity_id + "&take=10"),
-      qlooGet("/v2/insights?filter.type=urn:demographics&signal.interests.entities=" +
-        entity.entity_id).catch(() => null)
-    ]);
-    out.topTitles = ((movies.results || {}).entities || []).slice(0, 3).map(e => ({
-      name: e.name, affinity: (e.query && e.query.affinity) || 0
-    }));
-    const d = demo && demo.results && demo.results.demographics &&
-      demo.results.demographics[0] && demo.results.demographics[0].query;
-    if (d) {
-      const bands = { "24 and younger": "age.24_and_younger", "25-29": "age.25_to_29",
-        "30-34": "age.30_to_34", "35-44": "age.35_to_44", "45-54": "age.45_to_54",
-        "55+": "age.55_and_older" };
-      let best = null, bestV = -Infinity;
-      for (const [label, path] of Object.entries(bands)) {
-        const v = d.age[path.split(".")[1]];
-        if (typeof v === "number" && v > bestV) { bestV = v; best = label; }
-      }
-      const g = d.gender || {};
-      const lean = (g.male || 0) > (g.female || 0) ? "male-leaning" : "female-leaning";
-      out.skew = (best ? "skews " + best + ", " : "") + lean;
+function parseTitleInput(raw) {
+  const m = String(raw).match(/^(.*?)\s*\((\d{4})\)\s*$/);
+  if (m) return { title: m[1].trim(), year: parseInt(m[2], 10) };
+  return { title: String(raw).trim(), year: null };
+}
+
+/* Resolution is strict: a title counts as resolved only on a normalized
+   exact-name match. Anything else is UNRESOLVED, with the nearest
+   resolvable alternative proposed (never silently substituted). */
+async function resolveTitle(raw) {
+  const { title, year } = parseTitleInput(raw);
+  const ck = normKey(title) + "|" + (year || "");
+  if (cache.resolve[ck]) return cache.resolve[ck];
+  const results = await searchMovies(title); // throws on API failure
+  const exact = results.filter(r => normKey(r.name) === normKey(title));
+  let out;
+  if (exact.length) {
+    let chosen = null, decision = "";
+    if (year) {
+      chosen = exact.find(r => r.properties && r.properties.release_year === year) || null;
+      if (chosen) decision = "exact title + year match (" + year + ")";
     }
-  } catch (err) { /* profile stays empty; trace notes it */ }
-  cache.audience[entity.entity_id] = out;
+    if (!chosen) {
+      chosen = exact.slice().sort((a, b) => (b.popularity || 0) - (a.popularity || 0))[0];
+      decision = exact.length > 1
+        ? exact.length + " titles share this exact name; chose " + chosen.name +
+          " (" + (chosen.properties && chosen.properties.release_year || "year n/a") +
+          "), the most prominent (popularity " + pct1(chosen.popularity || 0) + ")"
+        : "exact title match";
+      if (year) decision += "; no exact-title candidate matched the year " + year;
+    }
+    out = { status: "resolved", entity: toEntity(chosen), decision };
+  } else {
+    const proposal = await findProposal(title);
+    out = { status: "unresolved", title, proposal,
+            decision: "no catalog title matches this name exactly" };
+  }
+  cache.resolve[ck] = out;
   return out;
 }
 
-async function crossDomain(entities) {
-  const ids = entities.filter(e => !e.simulated).slice(0, 2).map(e => e.entity_id);
-  if (!ids.length) return [];
-  const key = ids.join(",");
-  if (cache.cross[key]) return cache.cross[key];
-  const types = ["urn:entity:artist", "urn:entity:brand", "urn:entity:podcast"];
-  const lists = await Promise.all(types.map(async t => {
+async function findProposal(title) {
+  const words = title.replace(/[:\-]/g, " ").split(/\s+/).filter(Boolean);
+  const tries = [];
+  if (title.includes(":")) tries.push(title.split(":")[0].trim());
+  if (words.length > 3) tries.push(words.slice(0, 3).join(" "));
+  if (words.length > 2) tries.push(words.slice(0, 2).join(" "));
+  if (words.length > 1) tries.push(words[0]);
+  for (const q of [...new Set(tries)].slice(0, 3)) {
+    if (normKey(q) === normKey(title)) continue;
     try {
-      const d = await qlooGet("/v2/insights?filter.type=" + t +
-        "&signal.interests.entities=" + ids.join(",") + "&take=3");
-      return ((d.results || {}).entities || []).map(e => ({
-        name: e.name, type: t, entity_id: e.entity_id,
-        affinity: (e.query && e.query.affinity) || 0,
-        note: shortNote(e)
-      }));
-    } catch (err) { return []; }
-  }));
-  const merged = lists.flat().sort((x, y) => y.affinity - x.affinity).slice(0, 6);
-  cache.cross[key] = merged;
-  return merged;
+      const results = await searchMovies(q);
+      const hit = results.find(r => normKey(r.name) === normKey(q)) ||
+                  results.find(r => normKey(r.name).startsWith(normKey(q)));
+      if (hit) return toEntity(hit);
+    } catch (err) { /* proposal search is best-effort */ }
+  }
+  return null;
 }
 
+/* ---------- tone axis ---------- */
+function computeTone(a, b) {
+  const aKeys = new Set(a.toneTags.keys()), bKeys = new Set(b.toneTags.keys());
+  const shared = [...aKeys].filter(k => bKeys.has(k)).map(k => a.toneTags.get(k));
+  const onlyA = [...aKeys].filter(k => !bKeys.has(k)).map(k => a.toneTags.get(k));
+  const onlyB = [...bKeys].filter(k => !aKeys.has(k)).map(k => b.toneTags.get(k));
+  const rank = t => TAG_TYPE_RANK[t.type];
+  shared.sort((x, y) => rank(x) - rank(y));
+  onlyA.sort((x, y) => rank(x) - rank(y));
+  onlyB.sort((x, y) => rank(x) - rank(y));
+  const union = new Set([...aKeys, ...bKeys]).size;
+  return {
+    score: union ? shared.length / union : 0,
+    shared: shared.map(t => t.name),
+    onlyA: onlyA.map(t => t.name),
+    onlyB: onlyB.map(t => t.name),
+    aCount: aKeys.size, bCount: bKeys.size
+  };
+}
+
+/* ---------- audience axis ---------- */
+async function audienceBatch(reference, targets) {
+  const ids = targets.map(e => e.entity_id);
+  const data = await qlooGet("/v2/insights?filter.type=urn:entity:movie&signal.interests.entities=" +
+    reference.entity_id + "&filter.results.entities=" + ids.join(","));
+  const map = new Map();
+  for (const e of (data.results || {}).entities || [])
+    if (e.query && typeof e.query.affinity === "number") map.set(e.entity_id, e.query.affinity);
+  return map;
+}
+
+async function demographics(entity) {
+  if (cache.demo[entity.entity_id]) return cache.demo[entity.entity_id];
+  let out = { line: "", available: false };
+  try {
+    const d = await qlooGet("/v2/insights?filter.type=urn:demographics&signal.interests.entities=" + entity.entity_id);
+    const q = d.results && d.results.demographics && d.results.demographics[0] &&
+              d.results.demographics[0].query;
+    if (q) {
+      const bands = { "24 and younger": "24_and_younger", "25-29": "25_to_29",
+        "30-34": "30_to_34", "35-44": "35_to_44", "45-54": "45_to_54", "55+": "55_and_older" };
+      let best = null, bestV = 0;
+      for (const [label, key] of Object.entries(bands)) {
+        const v = q.age && q.age[key];
+        if (typeof v === "number" && v > bestV) { bestV = v; best = label; }
+      }
+      const g = q.gender || {};
+      let lean = "";
+      if (typeof g.male === "number" && g.male >= 0.05) lean = "male-leaning";
+      else if (typeof g.female === "number" && g.female >= 0.05) lean = "female-leaning";
+      const parts = [];
+      if (best) parts.push("core age band " + best);
+      if (lean) parts.push(lean);
+      if (parts.length) { out = { line: parts.join(", "), available: true }; }
+    }
+  } catch (err) { /* demographics stay unavailable; never guessed */ }
+  cache.demo[entity.entity_id] = out;
+  return out;
+}
+
+/* ---------- reference auto-selection (logline genuinely used) ---------- */
+function pitchKeywords(pitch) {
+  const words = (pitch.genre + " " + pitch.logline).toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(w => w.length >= 3);
+  const phrases = new Set();
+  for (const w of new Set(words)) {
+    phrases.add(normKey(w));
+    for (const exp of KEYWORD_EXPANSIONS[w] || []) phrases.add(normKey(exp));
+  }
+  return phrases;
+}
+function referenceScore(entity, phrases) {
+  const matched = entity.allTagNames.filter(t => {
+    const k = normKey(t.name);
+    for (const p of phrases) if (k.includes(p) || p.includes(k)) return true;
+    return false;
+  });
+  return matched;
+}
+
+/* ---------- cross-domain (validated audience, per category) ---------- */
+const CROSS_CATEGORIES = [
+  { type: "urn:entity:artist", label: "Artists", use: "Soundtrack and temp-score direction" },
+  { type: "urn:entity:podcast", label: "Podcasts", use: "Press-tour and trailer promotion channels" },
+  { type: "urn:entity:brand", label: "Brands", use: "Co-marketing and festival partners" }
+];
 function shortNote(e) {
   const sd = e.properties && e.properties.short_descriptions;
   const en = Array.isArray(sd) && sd.find(s => s.language === "en");
@@ -194,30 +266,51 @@ function shortNote(e) {
   text = text.split(/(?<=[.!?])\s/)[0];
   return text.length > 110 ? text.slice(0, 107) + "..." : text;
 }
+async function crossDomain(entities) {
+  const ids = entities.map(e => e.entity_id);
+  const key = ids.join(",");
+  if (cache.cross[key]) return cache.cross[key];
+  const groups = await Promise.all(CROSS_CATEGORIES.map(async c => {
+    try {
+      const d = await qlooGet("/v2/insights?filter.type=" + c.type +
+        "&signal.interests.entities=" + ids.join(",") + "&take=8&filter.popularity.max=0.99");
+      const items = ((d.results || {}).entities || [])
+        .filter(e => e.query && typeof e.query.affinity === "number")
+        .sort((x, y) => y.query.affinity - x.query.affinity).slice(0, 3)
+        .map(e => ({ name: e.name, affinity: e.query.affinity, note: shortNote(e) }));
+      return { ...c, items };
+    } catch (err) { return { ...c, items: [] }; }
+  }));
+  cache.cross[key] = groups;
+  return groups;
+}
 
-async function suggestions(anchor, entities) {
-  if (cache.suggest[anchor.entity_id]) return cache.suggest[anchor.entity_id];
-  let out = [];
-  try {
-    const d = await qlooGet("/v2/insights?filter.type=urn:entity:movie&signal.interests.entities=" +
-      anchor.entity_id + "&take=10");
-    const exclude = new Set(entities.map(e => e.entity_id));
-    out = ((d.results || {}).entities || [])
-      .filter(e => !exclude.has(e.entity_id))
-      .slice(0, 4)
-      .map(e => {
-        const shared = tasteTags(e).filter(t => anchor.tags.some(a => a.id === t.id));
-        return {
-          name: e.name, entity_id: e.entity_id,
-          audience_overlap: (e.query && e.query.affinity) || 0,
-          why: shared.length
-            ? "Shares the anchor's taste DNA: " + shared.slice(0, 3).map(t => t.name).join(", ") + "."
-            : "High measured affinity with the " + anchor.name + " audience."
-        };
-      });
-  } catch (err) { /* suggestions stay empty */ }
-  cache.suggest[anchor.entity_id] = out;
-  return out;
+/* ---------- Verify-Prune-Repair: alternatives ---------- */
+async function repairAlternatives(reference, validated, baseline, excludeIds) {
+  const signalIds = validated.map(e => e.entity_id);
+  const d = await qlooGet("/v2/insights?filter.type=urn:entity:movie&signal.interests.entities=" +
+    signalIds.join(",") + "&take=30&filter.release_year.min=1990");
+  const pool = (d.results || {}).entities || [];
+  const scored = [];
+  for (const cand of pool) {
+    if (excludeIds.has(cand.entity_id)) continue;
+    if (!cand.query || typeof cand.query.affinity !== "number") continue;
+    const ent = toEntity(cand);
+    if (!ent.toneTags.size) continue; // cannot verify its tone: filtered out
+    const tone = computeTone(reference, ent);
+    const tonePass = tone.score >= TONE_THRESHOLD;
+    const audPass = cand.query.affinity > baseline;
+    if (!tonePass && !audPass) continue; // never recommend a title the engine fails
+    scored.push({
+      name: ent.name, year: ent.year, affinity: cand.query.affinity,
+      tone: tone.score, shared: tone.shared,
+      verdict: tonePass && audPass ? "TRUE" : tonePass ? "TONE" : "MARKET",
+      combined: 0.5 * Math.min(tone.score / 0.25, 1) + 0.5 * cand.query.affinity
+    });
+  }
+  scored.sort((a, b) => (b.verdict === "TRUE") - (a.verdict === "TRUE") || b.combined - a.combined);
+  return { picks: scored.slice(0, 3), poolCount: pool.length,
+           trueCount: scored.filter(s => s.verdict === "TRUE").length };
 }
 
 /* ---------- trace ---------- */
@@ -237,224 +330,377 @@ function traceDone(li, detail) {
   li.innerHTML = "&#10003; " + li.textContent.replace(/^\s*/, "") +
     (detail ? '<span class="detail">' + detail + "</span>" : "");
 }
+function traceError(li, detail) {
+  li.className = "error";
+  li.innerHTML = "&#10007; " + li.textContent.replace(/^\s*/, "") +
+    (detail ? '<span class="detail">' + detail + "</span>" : "");
+}
 
-/* ---------- LLM-mode reasoning (plausible, unverified) ---------- */
-function llmReasoning(comp, pitch) {
-  const g = (comp.properties.genre || []).join("/").toLowerCase();
-  if (norm(comp.name) === "rrr") {
-    return "Both draw on Indian mythology and deliver large-scale spectacle. RRR proves the audience appetite for mythic Indian storytelling and broadens commercial upside.";
-  }
-  if (g.includes("horror")) {
-    return "Shares the folk-horror lane: period setting, dread over jump scares, mythology as engine. A natural tonal match for '" + pitch.title + "'.";
-  }
-  return "Overlapping genre DNA (" + (comp.properties.genre || []).join(", ") +
-    ") and comparable audience expectations. A defensible comp for the deck.";
+/* ---------- Plausibility Baseline (scripted illustration, no model) ---------- */
+function plausibilityReasoning(compTitle, pitch) {
+  const g = pitch.genre || "its genre";
+  return "Genre logic accepts \"" + compTitle + "\" at face value: it sits in the same " +
+    g + " conversation as the pitch, nothing on the surface contradicts it, and no " +
+    "audience data is consulted. This is how pitch rooms wave comps through, and how " +
+    "shared market, era and language cues get misread as closeness (Cultural & Lexical " +
+    "Proximity Bias). Scripted illustration: no model ran to produce this verdict.";
 }
 
 /* ---------- agent loop ---------- */
-async function runAgent() {
-  const pitch = {
+function readPitch() {
+  return {
     title: $("in-title").value.trim() || "Untitled",
     genre: $("in-genre").value.trim() || "Unspecified",
     logline: $("in-logline").value.trim(),
     comps: [$("in-comp1").value, $("in-comp2").value, $("in-comp3").value]
-      .map(s => s.trim()).filter(Boolean)
+      .map(s => s.trim()).filter(Boolean),
+    refChoice: $("in-ref").value // 'auto' | '0' | '1' | '2'
   };
+}
+
+async function runAgent() {
+  const pitch = readPitch();
   if (!pitch.comps.length) { alert("Enter at least one comp title."); return; }
   lastPitch = pitch;
-  runData = { pairs: {}, cross: [], suggest: [] };
-
   $("run-btn").disabled = true;
   $("results-card").classList.add("hidden");
   traceStart();
+  try {
+    if (mode === "baseline") runBaseline(pitch);
+    else await runQloo(pitch);
+  } finally {
+    $("run-btn").disabled = false;
+  }
+}
 
-  if (mode === "llm") {
-    const entities = [];
-    for (const c of pitch.comps) entities.push(await resolveEntity(c));
+function runBaseline(pitch) {
+  let li = traceStep("Reading the pitch (scripted baseline)");
+  traceDone(li, "\"" + pitch.title + "\" - " + pitch.genre +
+    ". This baseline works from the typed labels only.");
+  li = traceStep("Applying genre logic (scripted illustration)");
+  traceDone(li, "No model is run and no data is consulted in this mode. " +
+    "It demonstrates, deliberately, how a comp gets accepted on plausibility alone.");
+  li = traceStep("Verdict");
+  traceDone(li, "All comps accepted. Switch to Qloo Grounded to test them.");
+  renderResults({
+    mode: "baseline",
+    banner: { kind: "note", text: "Plausibility Baseline: a scripted illustration of genre-logic " +
+      "reasoning. No language model was run and no data was consulted; every comp below is " +
+      "accepted unverified, on purpose, so the Qloo Grounded contrast is honest." },
+    comps: pitch.comps.map(t => ({
+      name: t, status: "PLAUSIBLE", reason: plausibilityReasoning(t, pitch)
+    })),
+    summary: "Genre logic accepts all " + pitch.comps.length + " comps for \"" + pitch.title +
+      "\". Nothing was measured. That is the failure mode CompCheck exists to catch.",
+    badge: "mixed", badgeText: "UNVERIFIED - SCRIPTED BASELINE"
+  });
+}
 
-    let li = traceStep("Reading pitch with language model");
-    await sleep(700);
-    traceDone(li, '"' + pitch.title + "' - " + pitch.genre + ". Extracting tone, themes, audience cues from the logline.");
+async function runQloo(pitch) {
+  const result = { mode: "qloo", comps: [], banner: null };
 
-    li = traceStep("Matching comps from training knowledge");
-    await sleep(800);
-    traceDone(li, entities.map(e => e.name + " (" + (e.properties.genre || []).join("/") + ")").join(" - "));
+  /* 1. Resolve (agent decision point: disambiguation with reasons) */
+  let li = traceStep("Resolving comps to Qloo entities - GET /search");
+  const resolutions = [];
+  for (const t of pitch.comps) {
+    try { resolutions.push(await resolveTitle(t)); }
+    catch (err) { resolutions.push({ status: "error", title: t, error: err.message }); }
+  }
+  const resLines = resolutions.map((r, i) => {
+    if (r.status === "resolved")
+      return pitch.comps[i] + " -&gt; " + r.entity.name + " (" + (r.entity.year || "n/a") +
+        ") <code>" + r.entity.entity_id + "</code> - " + r.decision;
+    if (r.status === "unresolved")
+      return pitch.comps[i] + " -&gt; UNRESOLVED - " + r.decision +
+        (r.proposal ? "; nearest resolvable alternative: " + r.proposal.name +
+          " (" + (r.proposal.year || "n/a") + ")" : "");
+    return pitch.comps[i] + " -&gt; ERROR - " + r.error;
+  });
+  traceDone(li, resLines.join("<br>"));
 
-    li = traceStep("Synthesizing verdict");
-    await sleep(600);
-    traceDone(li, "All comps accepted on genre, tone and thematic similarity.");
-
-    renderResults(pitch, entities, llmVerdict(pitch, entities));
-  } else {
-    let li = traceStep("Resolving comps to Qloo entities - GET /search");
-    const entities = [];
-    for (const c of pitch.comps) entities.push(await resolveEntity(c));
-    traceDone(li, entities.map(e => e.name + " - <code>" + e.entity_id + "</code>" +
-      (e.simulated ? " (not in live catalog)" : "")).join("<br>"));
-
-    li = traceStep("Fetching audience profiles - GET /v2/insights");
-    const profiles = await Promise.all(entities.map(e =>
-      e.simulated ? Promise.resolve(null) : audienceProfile(e)));
-    const audLines = entities.map((e, i) => {
-      const p = profiles[i];
-      if (!p || !p.topTitles.length) return e.name + ": live profile unavailable.";
-      const top = p.topTitles[0];
-      return e.name + ": audience also loves " + top.name + " (" + Math.round(top.affinity * 100) +
-        "% affinity)" + (p.skew ? "; " + p.skew : "");
-    });
-    traceDone(li, audLines.join("<br>"));
-
-    li = traceStep("Computing pairwise taste overlap - Qloo taste tags");
-    const overlaps = [];
-    for (let i = 0; i < entities.length; i++)
-      for (let j = i + 1; j < entities.length; j++) {
-        if (entities[i].simulated || entities[j].simulated) continue;
-        const pair = computePair(entities[i], entities[j]);
-        runData.pairs[pairKey(entities[i], entities[j])] = pair;
-        overlaps.push(pair.a + " x " + pair.b + ": " + Math.round(pair.audience_overlap * 100) +
-          "% taste overlap (" + pair.verdict.replace("_", " ") + ")");
-      }
-    traceDone(li, overlaps.join("<br>") || "No live taste data for these titles.");
-
-    li = traceStep("Mining cross-domain affinities - artists, brands, podcasts");
-    runData.cross = await crossDomain(entities);
-    traceDone(li, runData.cross.slice(0, 3).map(x => x.name + " (" + x.type.split(":")[2] + ", " +
-      Math.round(x.affinity * 100) + "%)").join(" - ") || "No cross-domain data returned.");
-
-    li = traceStep("Finding audience-validated alternative comps");
-    runData.suggest = entities[0].simulated ? [] : await suggestions(entities[0], entities);
-    traceDone(li, runData.suggest.length
-      ? "Top alternative: " + runData.suggest[0].name + " (" +
-        Math.round(runData.suggest[0].audience_overlap * 100) + "% affinity with the anchor audience)."
-      : "No alternatives returned.");
-
-    li = traceStep("Synthesizing verdict");
-    await sleep(300);
-    traceDone(li, "Comps split by measured taste overlap, not genre tags.");
-
-    renderResults(pitch, entities, qlooVerdict(pitch, entities));
+  const resolvedIdx = resolutions.map((r, i) => r.status === "resolved" ? i : -1).filter(i => i >= 0);
+  if (!resolvedIdx.length) {
+    result.banner = { kind: "error", text: "No comp could be resolved against the live Qloo " +
+      "catalog, so no verdicts were issued. An unresolved title is not evidence against it." };
+    result.comps = resolutions.map((r, i) => ({
+      name: pitch.comps[i],
+      status: r.status === "error" ? "ERROR" : "UNRESOLVED",
+      reason: r.status === "error" ? r.error
+        : "Not found in the Qloo catalog under this exact name." +
+          (r.proposal ? " Nearest resolvable alternative: " + r.proposal.name +
+            " (" + (r.proposal.year || "n/a") + "). Add it as a comp to test it." : "")
+    }));
+    result.summary = "No verdicts: nothing resolved.";
+    result.badge = "fail"; result.badgeText = "NO VERDICTS";
+    renderResults(result);
+    return;
   }
 
-  $("run-btn").disabled = false;
-}
+  /* 2. Reference selection (explicit; logline drives Auto) */
+  li = traceStep("Selecting the reference comp");
+  let refIdx;
+  if (pitch.refChoice !== "auto" && resolutions[+pitch.refChoice] &&
+      resolutions[+pitch.refChoice].status === "resolved") {
+    refIdx = +pitch.refChoice;
+    traceDone(li, "Reference: " + resolutions[refIdx].entity.name + " - chosen by you. " +
+      "Every verdict below is measured against it, so results do not depend on typing order.");
+  } else {
+    const phrases = pitchKeywords(pitch);
+    const scored = resolvedIdx.map(i => ({
+      i, matched: referenceScore(resolutions[i].entity, phrases)
+    })).sort((a, b) => b.matched.length - a.matched.length ||
+      (resolutions[b.i].entity.popularity - resolutions[a.i].entity.popularity));
+    refIdx = scored[0].i;
+    traceDone(li, "Reference: " + resolutions[refIdx].entity.name +
+      " - auto-selected: its Qloo tag profile matches the most pitch keywords (" +
+      (scored[0].matched.map(t => t.name).join(", ") || "none") + "). Scores: " +
+      scored.map(s => resolutions[s.i].entity.name + " " + s.matched.length).join(", ") +
+      ". You can override this above; verdicts are always against the labelled reference.");
+  }
+  const reference = resolutions[refIdx].entity;
+  result.reference = { entity: reference };
 
-/* ---------- verdicts ---------- */
-function llmVerdict(pitch, entities) {
-  return {
-    mode: "llm",
-    comps: entities.map(e => ({
-      entity: e, verdict: "MATCH",
-      reason: llmReasoning(e, pitch),
-      score: null
-    })),
-    summary: "All " + entities.length + " comps accepted. On genre, tone and theme, '" +
-      pitch.title + "' sits comfortably alongside " +
-      entities.map(e => e.name).join(", ") + ". No data was consulted.",
-    badge: "mixed", badgeText: "UNVERIFIED"
-  };
-}
-
-function qlooVerdict(pitch, entities) {
-  const anchor = entities[0];
-  const anchorTop = anchor.tags.slice(0, 3).map(t => t.name).join(", ");
-  const comps = entities.map((e, i) => {
-    if (e.simulated)
-      return { entity: e, verdict: "UNVERIFIED", reason: "Not resolved in the live Qloo catalog, so no taste data backs this comp.", score: null };
-    if (i === 0)
-      return { entity: e, verdict: "ANCHOR",
-               reason: "Reference comp. Qloo taste profile: " + anchorTop +
-                 " (popularity " + Math.round(e.popularity * 100) + "%). This is the room your pitch must play in.",
-               score: 1 };
-    const ov = runData.pairs[pairKey(anchor, e)];
-    if (!ov) return { entity: e, verdict: "UNVERIFIED", reason: "No taste overlap computed for this pair.", score: null };
-    const pct = Math.round(ov.audience_overlap * 100);
-    if (ov.verdict === "TRUE_COMP")
-      return { entity: e, verdict: "TRUE COMP", score: ov.audience_overlap,
-               reason: pct + "% taste overlap with " + anchor.name + ". Shared: " + (ov.shared_affinities || []).join(", ") + "." };
-    return { entity: e, verdict: "FALSE COMP", score: ov.audience_overlap,
-             reason: "Only " + pct + "% taste overlap. " + (ov.divergence || "") };
+  /* comp result skeletons */
+  const compResults = resolutions.map((r, i) => {
+    if (i === refIdx) return { entity: r.entity, status: "REFERENCE",
+      reason: "Reference comp. Tone profile: " +
+        [...reference.toneTags.values()].slice(0, 5).map(t => t.name).join(", ") +
+        " (popularity " + pct1(reference.popularity) + ")." };
+    if (r.status === "unresolved") return { name: pitch.comps[i], status: "UNRESOLVED",
+      reason: "Not found in the Qloo catalog under this exact name, so no verdict is issued." +
+        (r.proposal ? " Nearest resolvable alternative: " + r.proposal.name +
+          " (" + (r.proposal.year || "n/a") + ")." : "") };
+    if (r.status === "error") return { name: pitch.comps[i], status: "ERROR", reason: r.error };
+    return { entity: r.entity, status: "PENDING" };
   });
-  const falses = comps.filter(c => c.verdict === "FALSE COMP");
-  return {
-    mode: "qloo",
-    comps,
-    summary: falses.length
-      ? falses.map(c => c.entity.name).join(", ") + " " +
-        (falses.length > 1 ? "are" : "is") +
-        " a FALSE COMP. The live Qloo taste data splits your deck: " +
-        comps.filter(c => c.verdict === "TRUE COMP" || c.verdict === "ANCHOR").map(c => c.entity.name).join(" and ") +
-        " share a real taste profile; " + falses.map(c => c.entity.name).join(", ") + " does not."
-      : "All comps validated against live Qloo taste data.",
-    badge: falses.length ? "fail" : "pass",
-    badgeText: falses.length ? "FALSE COMP FOUND" : "COMPS VALIDATED"
-  };
+
+  /* 3. Tone axis */
+  li = traceStep("Tone axis - taste-tag overlap (genre labels excluded)");
+  const toneByIdx = {};
+  for (const i of resolvedIdx) {
+    if (i === refIdx) continue;
+    toneByIdx[i] = computeTone(reference, resolutions[i].entity);
+  }
+  traceDone(li, resolvedIdx.filter(i => i !== refIdx).map(i => {
+    const t = toneByIdx[i];
+    return resolutions[i].entity.name + ": " + pct1(t.score) + " (" + t.shared.length +
+      " shared tone tags of " + (t.aCount + t.bCount - t.shared.length) + " combined" +
+      (t.shared.length ? "; shared: " + t.shared.slice(0, 5).join(", ") : "") + ")";
+  }).join("<br>") || "Only one comp resolved; no pair to score.");
+
+  /* 4. Audience axis (comps + controls in one batch) */
+  li = traceStep("Audience axis - GET /v2/insights affinity vs unrelated controls");
+  let affMap = new Map(), controls = [], baseline = null, audError = null;
+  try {
+    const controlRes = [];
+    for (const ct of CONTROL_TITLES) {
+      try { controlRes.push(await resolveTitle(ct)); } catch (err) { /* control optional */ }
+    }
+    controls = controlRes.filter(r => r.status === "resolved" && r.entity.entity_id !== reference.entity_id)
+      .map(r => r.entity);
+    const targets = [...resolvedIdx.filter(i => i !== refIdx).map(i => resolutions[i].entity),
+                     ...controls];
+    if (targets.length) {
+      affMap = await audienceBatch(reference, targets);
+      const cAff = controls.map(c => affMap.get(c.entity_id)).filter(v => typeof v === "number");
+      baseline = cAff.length ? Math.max(...cAff) : null;
+    }
+  } catch (err) { audError = err.message; }
+  if (audError) {
+    traceError(li, audError + " - audience axis unavailable; no audience verdicts issued.");
+  } else if (baseline === null) {
+    traceError(li, "No control films could be scored; audience axis unavailable.");
+  } else {
+    traceDone(li, "Control baseline (strongest unrelated film): " + aff1(baseline) + " - " +
+      controls.map(c => c.name + " " + aff1(affMap.get(c.entity_id) || 0)).join(", ") + ".<br>" +
+      resolvedIdx.filter(i => i !== refIdx).map(i =>
+        resolutions[i].entity.name + ": affinity " +
+        (affMap.has(resolutions[i].entity.entity_id)
+          ? aff1(affMap.get(resolutions[i].entity.entity_id)) : "not scored")).join("<br>"));
+  }
+
+  /* 5. Verdicts */
+  li = traceStep("Verdicts - tone x audience");
+  for (const i of resolvedIdx) {
+    if (i === refIdx) continue;
+    const cr = compResults[i], tone = toneByIdx[i];
+    const aff = affMap.has(cr.entity.entity_id) ? affMap.get(cr.entity.entity_id) : null;
+    cr.tone = tone; cr.affinity = aff; cr.baseline = baseline;
+    if (!tone.aCount || !tone.bCount) {
+      cr.status = "UNMEASURED";
+      cr.reason = "One side of this pair has no taste tags in its Qloo profile, so the tone axis cannot be measured and no verdict is issued.";
+      continue;
+    }
+    if (audError || baseline === null || aff === null) {
+      cr.status = "UNMEASURED";
+      cr.reason = "Tone measured at " + pct1(tone.score) + ", but the audience axis could not be scored, so no verdict is issued.";
+      continue;
+    }
+    const tonePass = tone.score >= TONE_THRESHOLD;
+    const audPass = aff > baseline;
+    cr.status = tonePass && audPass ? "TRUE" : tonePass ? "TONE" : audPass ? "MARKET" : "FALSE";
+    const sharedTxt = tone.shared.length ? tone.shared.slice(0, 4).join(", ") : "none";
+    if (cr.status === "TRUE")
+      cr.reason = "Both axes pass. Tone " + pct1(tone.score) + " (shared: " + sharedTxt +
+        ") and audience affinity " + aff1(aff) + ", above the control baseline " + aff1(baseline) + ".";
+    else if (cr.status === "TONE")
+      cr.reason = "Tone passes at " + pct1(tone.score) + " (shared: " + sharedTxt +
+        "), but audience affinity " + aff1(aff) + " does not beat unrelated controls (baseline " +
+        aff1(baseline) + "). Same kind of film; not the same audience.";
+    else if (cr.status === "MARKET")
+      cr.reason = "Audience affinity " + aff1(aff) + " beats the control baseline " +
+        aff1(baseline) + ", but tone overlap is only " + pct1(tone.score) + " (shared: " +
+        sharedTxt + "). The audience travels; the tone does not.";
+    else
+      cr.reason = "Neither axis supports this comp: tone " + pct1(tone.score) +
+        " (shared: " + sharedTxt + ") and audience affinity " + aff1(aff) +
+        ", at or below the control baseline " + aff1(baseline) + ".";
+  }
+  traceDone(li, compResults.filter(c => c.status && c.status !== "REFERENCE" && c.status !== "PENDING")
+    .map(c => (c.entity ? c.entity.name : c.name) + ": " + c.status).join(" - ") || "No verdicts.");
+
+  const verdicts = compResults.filter(c => ["TRUE", "TONE", "MARKET", "FALSE"].includes(c.status));
+  const incomplete = compResults.some(c => ["UNRESOLVED", "ERROR", "UNMEASURED"].includes(c.status));
+  if (!verdicts.length) {
+    result.badge = "fail"; result.badgeText = "NO VERDICTS";
+    result.summary = "No comp received a two-axis verdict.";
+  } else if (verdicts.every(c => c.status === "TRUE") && !incomplete) {
+    result.badge = "pass"; result.badgeText = "ALL COMPS TRUE";
+    result.summary = "Every comp passes both axes against " + reference.name + ".";
+  } else {
+    result.badge = "mixed";
+    result.badgeText = verdicts.map(c => c.entity.name + ": " + c.status).join(" · ").toUpperCase();
+    const parts = verdicts.map(c => c.entity.name + " is a " + c.status + " comp");
+    result.summary = "Against " + reference.name + ": " + parts.join("; ") + "." +
+      (incomplete ? " Some comps could not be fully measured (see cards)." : "");
+  }
+  result.comps = compResults;
+
+  /* 6. Verify-Prune-Repair */
+  li = traceStep("Verify-Prune-Repair - alternatives from the validated cluster");
+  const pruned = compResults.filter(c => c.status === "FALSE");
+  const validated = [reference, ...compResults.filter(c => c.status === "TRUE").map(c => c.entity)];
+  if (baseline === null) {
+    traceError(li, "Skipped: no control baseline, so alternatives cannot be held to the same standard.");
+    result.alternatives = null;
+  } else {
+    try {
+      const exclude = new Set([...resolutions.filter(r => r.status === "resolved").map(r => r.entity.entity_id),
+                               ...controls.map(c => c.entity_id)]);
+      const alt = await repairAlternatives(reference, validated, baseline, exclude);
+      result.alternatives = alt;
+      traceDone(li, (pruned.length
+        ? "Pruned " + pruned.map(c => c.entity.name).join(", ") + " (FALSE) from the repair signal. "
+        : "Nothing to prune. ") +
+        "Seeded with the validated cluster (" + validated.map(e => e.name).join(", ") + "); scored " +
+        alt.poolCount + " candidates on both axes; " + alt.trueCount + " pass both.");
+    } catch (err) {
+      traceError(li, "Alternatives query failed: " + err.message);
+      result.alternatives = null;
+    }
+  }
+
+  /* 7. Cross-domain + demographics on the validated cluster */
+  li = traceStep("Cross-domain - what the validated audience loves");
+  try {
+    result.cross = await crossDomain(validated);
+    result.demo = await demographics(reference);
+    traceDone(li, result.cross.map(g => g.label + ": " +
+      (g.items.map(x => x.name).join(", ") || "none returned")).join(" - ") +
+      (result.demo.available ? "<br>" + reference.name + " audience: " + result.demo.line + "." : ""));
+  } catch (err) {
+    traceError(li, err.message);
+    result.cross = null;
+  }
+
+  renderResults(result);
 }
 
 /* ---------- rendering ---------- */
 function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 
-function renderResults(pitch, entities, verdict) {
+function renderResults(r) {
   $("results-card").classList.remove("hidden");
   const badge = $("verdict-badge");
-  badge.className = "badge " + verdict.badge;
-  badge.textContent = verdict.badgeText;
-  $("verdict-summary").textContent = verdict.summary;
+  badge.className = "badge " + r.badge;
+  badge.textContent = r.badgeText;
+  $("verdict-summary").textContent = r.summary;
 
-  $("comp-cards").innerHTML = verdict.comps.map(c => {
-    const cls = c.verdict === "FALSE COMP" ? "false" : "true";
-    const status = c.verdict === "ANCHOR" ? "Reference comp" : c.verdict;
-    return '<div class="comp-card ' + cls + '"><h4>' + esc(c.entity.name) + "</h4>" +
-      '<div class="status">' + status + "</div>" +
-      '<div class="reason">' + esc(c.reason) + "</div>" +
-      (c.score !== null && c.verdict !== "ANCHOR"
-        ? '<div class="score">Taste overlap: ' + Math.round(c.score * 100) + "%</div>" : "") +
-      (c.entity.simulated ? '<div class="score">Not resolved live</div>' : "") +
+  const banner = $("run-banner");
+  if (r.banner) {
+    banner.className = "banner " + r.banner.kind;
+    banner.textContent = r.banner.text;
+    banner.classList.remove("hidden");
+  } else banner.classList.add("hidden");
+
+  const cardCls = s => ({ TRUE: "true", FALSE: "false", TONE: "tone", MARKET: "market",
+    REFERENCE: "anchor", PLAUSIBLE: "market" }[s] || "unresolved");
+  $("comp-cards").innerHTML = r.comps.map(c => {
+    const name = c.entity ? c.entity.name + (c.entity.year ? " (" + c.entity.year + ")" : "") : c.name;
+    return '<div class="comp-card ' + cardCls(c.status) + '"><h4>' + esc(name) + "</h4>" +
+      '<div class="status">' + (c.status === "REFERENCE" ? "Reference comp" : c.status) + "</div>" +
+      '<div class="reason">' + esc(c.reason || "") + "</div>" +
+      (c.tone ? '<div class="score">Tone: ' + pct1(c.tone.score) +
+        " (threshold " + pct1(TONE_THRESHOLD) + ")</div>" : "") +
+      (typeof c.affinity === "number" ? '<div class="score">Audience affinity: ' + aff1(c.affinity) +
+        " vs control baseline " + aff1(c.baseline) + "</div>" : "") +
       "</div>";
   }).join("");
 
-  // overlap bars (live taste overlap, Qloo mode only)
+  /* two-axis table (Qloo mode only) */
   let rows = "";
-  if (verdict.mode === "qloo") {
-    for (let i = 0; i < entities.length; i++)
-      for (let j = i + 1; j < entities.length; j++) {
-        const ov = runData.pairs[pairKey(entities[i], entities[j])];
-        if (!ov) continue;
-        const pct = Math.round(ov.audience_overlap * 100);
-        const good = ov.verdict === "TRUE_COMP";
-        rows += '<div class="overlap-row"><div class="names">' + esc(ov.a) + " x " + esc(ov.b) +
-          ' <span class="pct">- ' + pct + "% shared taste</span></div>" +
-          '<div class="bar"><div class="' + (good ? "hi" : "lo") + '" style="width:' + pct + '%"></div></div></div>';
-      }
+  if (r.mode === "qloo") {
+    for (const c of r.comps) {
+      if (!c.tone) continue;
+      const tpct = Math.round(c.tone.score * 100);
+      rows += '<div class="overlap-row"><div class="names">' + esc(r.reference.entity.name) +
+        " x " + esc(c.entity.name) + ' <span class="pct">- tone ' + pct1(c.tone.score) +
+        (typeof c.affinity === "number"
+          ? "; audience " + aff1(c.affinity) + " (controls up to " + aff1(c.baseline) + ")" : "") +
+        " - " + c.status + "</span></div>" +
+        '<div class="bar"><div class="' + (c.tone.score >= TONE_THRESHOLD ? "hi" : "lo") +
+        '" style="width:' + Math.min(tpct, 100) + '%"></div></div></div>';
+    }
   }
   $("overlap").innerHTML = rows ||
-    '<p class="fineprint">No live overlap data for these titles in Qloo mode. LLM mode shows no overlap data by design.</p>';
+    '<p class="fineprint">No two-axis data in this mode. The Plausibility Baseline measures nothing, by design.</p>';
 
-  // cross-domain + suggest only meaningful in qloo mode
-  const qloo = verdict.mode === "qloo";
+  const qloo = r.mode === "qloo";
   $("insights-block").classList.toggle("qloo-off", !qloo);
   $("suggest-block").classList.toggle("qloo-off", !qloo);
 
   $("insights").innerHTML = qloo
-    ? runData.cross.map(x =>
-        '<div class="insight"><div class="kind">' + x.type.split(":")[2] + "</div>" +
+    ? (r.demo && r.demo.available
+        ? '<div class="insight"><div class="kind">Audience</div><strong>' +
+          esc(r.reference.entity.name) + "</strong>" + '<div class="aff">' + esc(r.demo.line) +
+          '</div><div class="note">Buyer quadrant for sales agents and streamers.</div></div>' : "") +
+      (r.cross || []).map(g => g.items.map(x =>
+        '<div class="insight"><div class="kind">' + g.label + "</div>" +
         "<strong>" + esc(x.name) + "</strong>" +
-        '<div class="aff">' + Math.round(x.affinity * 100) + "% affinity</div>" +
-        '<div class="note">' + esc(x.note) + "</div></div>").join("") ||
+        '<div class="aff">' + aff1(x.affinity) + " affinity</div>" +
+        '<div class="note">' + esc(x.note || g.use) + "</div>" +
+        '<div class="note"><em>' + g.use + ".</em></div></div>").join("")).join("") ||
       '<p class="fineprint">No cross-domain affinities returned.</p>'
-    : '<p class="fineprint">Switch to Qloo Grounded to see what the audience actually loves.</p>';
+    : '<p class="fineprint">Switch to Qloo Grounded to see what the validated audience actually loves.</p>';
 
   $("suggest").innerHTML = qloo
-    ? runData.suggest.map(s =>
-        '<div class="suggest-item"><div><strong>' + esc(s.name) + "</strong>" +
-        '<div class="why">' + esc(s.why) + "</div></div>" +
-        '<div class="ov">' + Math.round(s.audience_overlap * 100) + "%</div></div>").join("") ||
-      '<p class="fineprint">No alternatives returned.</p>'
-    : '<p class="fineprint">Switch to Qloo Grounded for audience-validated alternatives.</p>';
+    ? (r.alternatives && r.alternatives.picks.length
+        ? r.alternatives.picks.map(s =>
+          '<div class="suggest-item"><div><strong>' + esc(s.name) +
+          (s.year ? " (" + s.year + ")" : "") + "</strong>" +
+          ' <span class="chip ' + s.verdict.toLowerCase() + '">' + s.verdict + "</span>" +
+          '<div class="why">Passes the same two-axis test against ' + esc(r.reference.entity.name) +
+          ": tone " + pct1(s.tone) + ", audience " + aff1(s.affinity) +
+          (s.shared.length ? ". Shared tone: " + esc(s.shared.slice(0, 3).join(", ")) : "") +
+          ".</div></div>" +
+          '<div class="ov">' + aff1(s.affinity) + "</div></div>").join("")
+        : '<p class="fineprint">No alternative in the pool passed the two-axis test this run.</p>')
+    : '<p class="fineprint">Switch to Qloo Grounded for alternatives that pass the same test.</p>';
 
   $("results-card").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-/* ---------- mode toggle ---------- */
+/* ---------- mode toggle + wiring (browser only) ---------- */
 function setMode(m) {
   mode = m;
   const t = $("mode-toggle");
@@ -462,17 +708,26 @@ function setMode(m) {
   t.setAttribute("aria-checked", m === "qloo");
   document.querySelectorAll(".toggle-opt").forEach(o =>
     o.classList.toggle("active", o.dataset.mode === m));
-  $("mode-hint").textContent = m === "llm"
-    ? "Language model reasoning. Plausible, unverified."
-    : "Live Qloo taste-graph data. Watch the false comps turn red.";
+  $("mode-hint").textContent = m === "baseline"
+    ? "A scripted illustration of genre-logic reasoning. No model runs, no data is consulted."
+    : "Live Qloo taste-graph data: two axes, four verdicts, controls included.";
   if (lastPitch && !$("results-card").classList.contains("hidden")) runAgent();
 }
 
-$("mode-toggle").addEventListener("click", e => {
-  const opt = e.target.closest(".toggle-opt");
-  if (opt) setMode(opt.dataset.mode);
-});
-$("mode-toggle").addEventListener("keydown", e => {
-  if (e.key === " " || e.key === "Enter") { e.preventDefault(); setMode(mode === "llm" ? "qloo" : "llm"); }
-});
-$("run-btn").addEventListener("click", runAgent);
+if (typeof document !== "undefined") {
+  $("mode-toggle").addEventListener("click", e => {
+    const opt = e.target.closest(".toggle-opt");
+    if (opt) setMode(opt.dataset.mode);
+  });
+  $("mode-toggle").addEventListener("keydown", e => {
+    if (e.key === " " || e.key === "Enter") { e.preventDefault(); setMode(mode === "baseline" ? "qloo" : "baseline"); }
+  });
+  $("run-btn").addEventListener("click", runAgent);
+}
+
+/* Node export for the test harness (ignored by browsers). */
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { resolveTitle, computeTone, audienceBatch, demographics,
+    repairAlternatives, crossDomain, pitchKeywords, referenceScore, parseTitleInput,
+    TONE_THRESHOLD, CONTROL_TITLES };
+}
