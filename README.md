@@ -102,7 +102,7 @@ node tests/run-tests.mjs
 
 ## Architecture and the API key
 
-Zero-infrastructure static site (HTML, CSS, vanilla JS, no build step); every Qloo request and its result is inspectable in the agent trace. The client currently calls the hackathon API directly (the demo configuration). A Cloudflare Worker proxy ships in [`proxy/`](proxy/README.md): it injects the key from a server-side secret and caches responses privately. The client already routes through a configurable base URL (`QLOO_PROXY` in `app.js`); deploying the worker and flipping that constant is the production cutover, and rotating the key afterwards needs no client change.
+Zero-infrastructure static site (HTML, CSS, vanilla JS, no build step); every Qloo request and its result is inspectable in the agent trace. All API calls route through a small proxy deployed on Vercel (source: https://github.com/rsaxena3011/compcheck-proxy, live at https://compcheck-proxy.vercel.app), which injects the API key from a server-side environment variable and allowlists the two endpoint families the app uses. The key is not present in this repo, in its git history, or in the client; rotating it needs no client change. An earlier Cloudflare Worker variant of the same proxy is kept in [`proxy/`](proxy/README.md) for reference.
 
 ## Limitations
 
