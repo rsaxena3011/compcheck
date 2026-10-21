@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CompCheck - Validate your pitch comps against real audience data</title>
+<title>CompCheck - Do your comps share a tone and an audience?</title>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <header class="site-header">
   <div class="wrap">
     <div class="brand"><span class="logo">CC</span> CompCheck</div>
-    <div class="tagline">Do your comps share an audience, or just a genre tag?</div>
+    <div class="tagline">Comps sell two things: a tone and an audience. CompCheck tests both against Qloo's taste graph.</div>
   </div>
 </header>
 
@@ -25,7 +25,7 @@
         <input id="in-genre" type="text" value="Folk Horror">
       </label>
     </div>
-    <label>Logline
+    <label>Logline (used to auto-select the reference comp)
       <textarea id="in-logline" rows="3">A cursed harvest festival in rural Maharashtra forces a young widow to confront the folk goddess her village has fed for generations.</textarea>
     </label>
     <label>Comp titles (the ones in your deck)
@@ -35,19 +35,27 @@
         <input id="in-comp3" type="text" value="RRR">
       </div>
     </label>
+    <label>Reference comp (every verdict is measured against this one)
+      <select id="in-ref">
+        <option value="auto" selected>Auto: closest match to my pitch (logline + genre)</option>
+        <option value="0">Comp 1 (first field)</option>
+        <option value="1">Comp 2 (second field)</option>
+        <option value="2">Comp 3 (third field)</option>
+      </select>
+    </label>
 
     <div class="mode-row">
       <span class="mode-label">Validation mode</span>
       <div class="toggle" id="mode-toggle" role="switch" aria-checked="false" tabindex="0">
-        <div class="toggle-opt active" data-mode="llm">LLM Only</div>
+        <div class="toggle-opt active" data-mode="baseline">Plausibility Baseline</div>
         <div class="toggle-opt" data-mode="qloo">Qloo Grounded</div>
         <div class="toggle-thumb"></div>
       </div>
-      <span class="mode-hint" id="mode-hint">Language model reasoning. Plausible, unverified.</span>
+      <span class="mode-hint" id="mode-hint">A scripted illustration of genre-logic reasoning. No model runs, no data is consulted.</span>
     </div>
 
     <button id="run-btn" class="primary">Run CompCheck</button>
-    <p class="fineprint">Live demo. In <strong>Qloo Grounded</strong> mode every verdict is computed in real time from the Qloo Taste AI API (hackathon key). Responses are used in-memory only and never stored.</p>
+    <p class="fineprint">Live demo. In <strong>Qloo Grounded</strong> mode every verdict is computed in real time from the Qloo Taste AI API: a tone axis (taste-tag overlap, broad genre labels excluded) and an audience axis (affinity that must beat three unrelated control films). The <strong>Plausibility Baseline</strong> is a scripted illustration and consults no data. Responses are used in-memory only and never stored.</p>
   </section>
 
   <section class="card hidden" id="trace-card">
@@ -57,10 +65,11 @@
 
   <section class="card hidden" id="results-card">
     <h2>Verdict <span id="verdict-badge" class="badge"></span></h2>
+    <div id="run-banner" class="banner hidden"></div>
     <p id="verdict-summary" class="verdict-summary"></p>
     <h3>Comp validation</h3>
     <div id="comp-cards" class="comp-cards"></div>
-    <h3>Audience overlap</h3>
+    <h3>Two-axis scores</h3>
     <div id="overlap" class="overlap"></div>
     <div id="insights-block">
       <h3>What this audience actually loves <span class="qloo-only">(Qloo mode)</span></h3>

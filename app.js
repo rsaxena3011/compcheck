@@ -729,5 +729,5 @@ if (typeof document !== "undefined") {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { resolveTitle, computeTone, audienceBatch, demographics,
     repairAlternatives, crossDomain, pitchKeywords, referenceScore, parseTitleInput,
-    TONE_THRESHOLD, CONTROL_TITLES };
+    normKey, TONE_THRESHOLD, CONTROL_TITLES };
 }
