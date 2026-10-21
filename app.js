@@ -14,14 +14,12 @@
    in the catalog) and ERROR (the API failed; an error is never evidence).
    Responses are used in-memory only; no Qloo response data is stored.
 
-   Proxy readiness: set QLOO_PROXY to the deployed proxy/worker.js URL and
-   every call routes through it (the worker injects the key server-side).
-   While QLOO_PROXY is empty the client calls the API directly, as the
-   live demo does today. */
+   All calls route through the deployed proxy
+   (https://compcheck-proxy.vercel.app), which injects the API key
+   server-side from a Vercel environment variable. The key is never
+   present in this client. */
 
-const QLOO_PROXY = ""; // e.g. "https://compcheck-proxy.example.workers.dev"
-const QLOO_DIRECT = "https://hackathon.api.qloo.com";
-const QLOO_KEY = "***REMOVED***";
+const QLOO_PROXY = "https://compcheck-proxy.vercel.app";
 const TONE_THRESHOLD = 0.10; // calibrated: see README "Calibration"
 const CONTROL_TITLES = ["Dangal", "Paddington 2", "Top Gun: Maverick"];
 const TASTE_TAG_TYPES = new Set([
@@ -65,8 +63,8 @@ const aff1 = x => (x * 100).toFixed(1);
 const cache = { resolve: {}, cross: {}, demo: {} };
 
 async function qlooGet(path) {
-  const url = (QLOO_PROXY || QLOO_DIRECT) + path;
-  const headers = QLOO_PROXY ? {} : { "X-Api-Key": QLOO_KEY };
+  const url = QLOO_PROXY + path;
+  const headers = {};
   let lastErr = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     const ctrl = new AbortController();

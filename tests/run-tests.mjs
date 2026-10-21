@@ -1,6 +1,6 @@
 /* CompCheck live test harness.
    Exercises the shipped engine functions from ../app.js against the live
-   Qloo hackathon API. The API key is read from app.js by app.js itself;
+   Qloo hackathon API, reached through the deployed proxy (the API key lives server-side in the proxy, never in this repo);
    this file never sees or prints it.
    Run: node tests/run-tests.mjs   (requires network access to the API) */
 import { createRequire } from "node:module";
