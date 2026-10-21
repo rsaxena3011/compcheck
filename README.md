@@ -72,6 +72,8 @@ The 10% tone threshold is not a guess. Measured on the live API (2026-10-21), kn
 
 Tag-set Jaccard over Qloo's granular taxonomy is naturally sparse (a pair's combined tone profile runs to 50-60 tags), which is why the separating band sits near 10% rather than at a rounder number.
 
+Composition and an honest disclosure: the set is 13 pairs (7 tone-kin, 6 non-kin), labelled by editorial judgment of the films' tone, not by the scores. Two pairs (Tumbbad x Bulbbul, Tumbbad x RRR) also appear in the demo deck. The third demo pair, Tumbbad x The Witch at 16.7%, was not part of this calibration set and lands inside the kin band. Treat the threshold as a transparent, project-defined screening rule calibrated on a small set, not as a validated general measure.
+
 ## How we use Qloo
 
 | Qloo call | What CompCheck does with it |
